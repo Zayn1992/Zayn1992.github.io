@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Alamanda Pass</title>
+<meta name="apple-mobile-web-app-title" content="Alamanda Pass">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#0B130C">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="manifest" href="manifest.webmanifest">
+<style>
+  html, body { margin: 0; height: 100%; background: #0B130C; }
+  iframe { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; padding-top: env(safe-area-inset-top); box-sizing: border-box; background: #0B130C; }
+  p { color: #E9ECE2; font: 16px/1.5 system-ui, sans-serif; padding: 24px; }
+</style>
+</head>
+<body>
+<!--
+  Alamanda Visitor Pass home page.
+  It shows the Google Apps Script app full screen, without Google's banner,
+  and gives the app its logo when saved to an iPhone or Android home screen.
+  ONLY CHANGE THE LINE BELOW: paste your web app link (it ends with /exec).
+-->
+<script>
+var APP_LINK = 'PASTE_YOUR_WEB_APP_LINK_HERE';
+</script>
+<iframe id="app" title="Alamanda Visitor Pass" allow="camera; clipboard-write; web-share"></iframe>
+<script>
+  if (APP_LINK.indexOf('https://script.google.com/') !== 0) {
+    document.body.innerHTML = '<p>Setup is not finished: paste the web app link into index.html.</p>';
+  } else {
+    // Pass links such as ?pass=ABC123, ?scan=ABC123 or ?mode=guard straight through to the app.
+    document.getElementById('app').src = APP_LINK.replace(/[?#].*$/, '') + location.search;
+  }
+</script>
+</body>
+</html>
