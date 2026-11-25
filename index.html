@@ -1,41 +1,646 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Alamanda Pass</title>
-<meta name="apple-mobile-web-app-title" content="Alamanda Pass">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black">
-<meta name="theme-color" content="#0B130C">
-<link rel="apple-touch-icon" href="icon-180.png">
-<link rel="icon" type="image/png" href="icon-192.png">
-<link rel="manifest" href="manifest.webmanifest">
-<style>
-  html, body { margin: 0; height: 100%; background: #0B130C; }
-  iframe { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; padding-top: env(safe-area-inset-top); box-sizing: border-box; background: #0B130C; }
-  p { color: #E9ECE2; font: 16px/1.5 system-ui, sans-serif; padding: 24px; }
-</style>
-</head>
-<body>
-<!--
-  Alamanda Visitor Pass home page.
-  It shows the Google Apps Script app full screen, without Google's banner,
-  and gives the app its logo when saved to an iPhone or Android home screen.
-  ONLY CHANGE THE LINE BELOW: paste your web app link (it ends with /exec).
--->
-<script>
-var APP_LINK = 'https://script.google.com/macros/s/AKfycbwFpkPMXUCqSHsYxgSpAfiPlbAmcVa23l_j6p-GPCYTvFT1VYatAyLc4O1oIARhEXTR/exec';
-</script>
-<iframe id="app" title="Alamanda Visitor Pass" allow="camera; clipboard-write; web-share"></iframe>
-<script>
-  if (APP_LINK.indexOf('https://script.google.com/') !== 0) {
-    document.body.innerHTML = '<p>Setup is not finished: paste the web app link into index.html.</p>';
-  } else {
-    // Pass links such as ?pass=ABC123, ?scan=ABC123 or ?mode=guard straight through to the app.
-    document.getElementById('app').src = APP_LINK.replace(/[?#].*$/, '') + location.search;
+/**
+ * Residensi Alamanda - Visitor Pass (version 1)
+ *
+ * Free visitor registration with QR passes, running on Google Sheets + Apps Script.
+ * Residents register a visitor -> get a pass link with a QR code to send by WhatsApp.
+ * Guards scan the QR (or type the 6-letter code) -> check the visitor in and out.
+ *
+ * Install: open the Google Sheet > Extensions > Apps Script. Paste this file as Code.gs,
+ * add an HTML file named App (paste App.html), run setup() once, then Deploy as a web app.
+ * Full steps are in the setup guide.
+ */
+
+/***** SETTINGS - most settings live in the "Settings" tab of the sheet *****/
+const TIMEZONE = 'Asia/Kuala_Lumpur';
+const MAX_WRONG_PINS = 5;          // wrong PIN tries before a 15-minute lock
+/***** END OF SETTINGS *****/
+
+const UNIT_HEADERS = ['Unit', 'PIN', 'Resident name', 'Phone', 'Active (Y/N)', 'Notes'];
+const VISITOR_HEADERS = ['Pass code', 'Created', 'Unit', 'Visitor name', 'Phone', 'Vehicle plate',
+  'Purpose', 'Pax', 'Visit date', 'Valid until', 'Status', 'Checked in', 'Checked out',
+  'Guard', 'Notes', 'Created by', 'Parking level', 'Bay no'];
+const LEVELS = ['G', 'LG'];                         // visitor parking levels; bay counts are in Settings
+const COL = {}; VISITOR_HEADERS.forEach((h, i) => COL[h] = i);
+// Follows the "Visitor Car Park" overnight form of Residensi Alamanda Management Corporation.
+// Status and nights left come first, so the office sees them without scrolling.
+const OVERNIGHT_HEADERS = ['Status', 'Nights left this month', 'Request no', 'Date of booking', 'Unit', 'Resident name', 'Owner / Tenant', 'Tel no', 'IC no',
+  'Visitor name', 'Car plate', 'Car model & colour', 'Arrive', 'Leave', 'Nights', 'Remark', 'Agreed to terms',
+  'Approved by', 'Payment mode', 'Amount received (RM)', 'Cheque no', 'Bank ref no', 'Official receipt no', 'MO notes', 'Pass code'];
+const NIGHTS_LEFT = 'Nights left this month';
+const OCOL = {}; OVERNIGHT_HEADERS.forEach((h, i) => OCOL[h] = i);
+const OVERNIGHT_STATUSES = ['Pending', 'Approved', 'Not approved'];
+const PAYMENT_MODES = ['Cash', 'IBG Online Transfer', 'Cheque'];
+const PURPOSES = ['Guest', 'Family', 'Contractor', 'Ride-hailing', 'Other'];
+const OVERNIGHT = 'Overnight';                      // purpose used for passes made from approved overnight requests
+
+/** Run once by hand. Creates the tabs, a guard PIN and a daily clean-up timer. Safe to run again. */
+function setup() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const units = ensureSheet_(ss, 'Units', UNIT_HEADERS);
+  units.getRange('A:B').setNumberFormat('@');            // keep "A-13A-10" and "012345" as text
+  addMissingUnits_(units);                                // all 682 units, each with its own PIN
+  const vis = ensureSheet_(ss, 'Visitors', VISITOR_HEADERS);
+  vis.getRange(1, 1, 1, VISITOR_HEADERS.length).setValues([VISITOR_HEADERS]).setFontWeight('bold');  // adds new columns to older sheets
+  vis.getRange('A:R').setNumberFormat('@');
+  const on = ensureSheet_(ss, 'Overnight', OVERNIGHT_HEADERS);
+  arrangeOvernight_(on);
+  const st = ensureSheet_(ss, 'Settings', ['Setting', 'Value', 'What it does']);
+  st.getRange('B:B').setNumberFormat('@');
+  const have = st.getDataRange().getDisplayValues().map(r => r[0]);
+  [
+    ['Condo name', 'Residensi Alamanda', 'Shown on passes'],
+    ['Guard PIN', randomPin_(), 'Guards type this once on the guardhouse phone. Change it any time.'],
+    ['Visitor bays Level G', '27', 'Number of visitor parking bays on Level G (bays 1 to this number)'],
+    ['Visitor bays Level LG', '37', 'Number of visitor parking bays on Level LG (bays 1 to this number)'],
+    ['Max overnight nights', '2', 'Terms item 3: longest single overnight parking request (consecutive nights)'],
+    ['Max overnight nights per month', '6', 'Terms item 2: overnight nights per unit per month'],
+    ['Same-day overnight cutoff', '', 'Leave empty to accept same-day requests at any time. Or type a time such as 17:00: after it, the earliest arrival is tomorrow.'],
+    ['Max passes per unit per day', '10', 'Stops abuse'],
+    ['Keep visitor records (days)', '90', 'Older visitor rows are deleted every night (PDPA)'],
+    ['App address (home page link)', '', 'Optional. Your free home page address, e.g. https://alamanda-pass.netlify.app . QR codes and WhatsApp links then use it. Leave empty to use the Apps Script link.'],
+    ['App icon (Drive file ID)', '1rcA1o13u-cJUfgD6WvuIa1HVeCvxB7HZ', 'Logo used when residents add the app to their home screen. Share that Drive image as Anyone with the link can view. Leave empty for no icon.']
+  ].forEach(r => { if (have.indexOf(r[0]) < 0) st.appendRow(r); });   // only adds settings that are missing
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'cleanupOldRecords')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('cleanupOldRecords').timeBased().everyDays(1).atHour(3).create();
+}
+
+/** Fills in a random 6-digit PIN for every unit row that has none. Run by hand after adding units. */
+function fillMissingPins() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Units');
+  const last = sh.getLastRow();
+  if (last < 2) return;
+  const rng = sh.getRange(2, 2, last - 1, 1);
+  rng.setValues(rng.getValues().map(r => [String(r[0]).trim() ? r[0] : randomPin_()]));
+}
+
+/** Web app entry point. */
+function doGet() {
+  const out = HtmlService.createHtmlOutputFromFile('App')
+    .setTitle('Alamanda Visitor Pass')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    // Lets the free home page (see the setup guide) show the app inside it, which hides Google's
+    // "created by a Google Apps Script user" bar and gives the app a proper home-screen logo.
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  // Home-screen / tab icon. The Drive image must be shared as "Anyone with the link can view".
+  try {
+    let icon = setting_('App icon (Drive file ID)').trim();
+    if (/^[\w-]{20,}$/.test(icon)) icon = 'https://drive.google.com/uc?id=' + icon + '&export=download&format=png';
+    if (/^https:\/\//.test(icon)) out.setFaviconUrl(icon);
+  } catch (e) { /* a bad icon setting must never stop the app from opening */ }
+  return out;
+}
+
+/** Single entry point the page calls through google.script.run. */
+function api(action, data) {
+  OV_CACHE = null;
+  try {
+    const fn = ACTIONS[action];
+    if (!fn) throw new Error('Unknown action.');
+    return { ok: true, result: fn(data || {}) };
+  } catch (err) {
+    return { ok: false, error: String(err && err.message || err) };
   }
-</script>
-</body>
-</html>
+}
+
+const ACTIONS = {
+  config: () => ({
+    condo: setting_('Condo name') || 'Residensi Alamanda',
+    url: appAddress_(),
+    maxNights: Number(setting_('Max overnight nights')) || 2,
+    maxNightsMonth: Number(setting_('Max overnight nights per month')) || 6,
+    overnightEarliest: earliestOvernight_(),
+    overnightCutoff: overnightCutoff_(),
+    purposes: PURPOSES,
+    today: today_()
+  }),
+
+  residentLogin: d => { const u = checkResident_(d.unit, d.pin); return { unit: u.unit, name: u.name }; },
+
+  createPass: d => {
+    const u = checkResident_(d.unit, d.pin);
+    return withLock_(() => addVisitor_(u.unit, d.visitor || {}, 'Resident', false, ''));
+  },
+
+  myPasses: d => {
+    const u = checkResident_(d.unit, d.pin);
+    const t = today_();
+    return readVisitors_()
+      .filter(v => v.unit === u.unit && (v.validUntil >= addDays_(t, -14)))
+      .sort((a, b) => (b.visitDate + b.created).localeCompare(a.visitDate + a.created))
+      .slice(0, 40)
+      .map(v => decorate_(v, t));
+  },
+
+  cancelPass: d => {
+    const u = checkResident_(d.unit, d.pin);
+    return withLock_(() => {
+      const row = findRow_(d.code);
+      if (!row || row.v.unit !== u.unit) throw new Error('Pass not found.');
+      if (row.v.status === 'Checked in') throw new Error('This visitor is already inside. The guard will check them out.');
+      setCells_(row.n, { 'Status': 'Cancelled' });
+      return decorate_(Object.assign(row.v, { status: 'Cancelled' }), today_());
+    });
+  },
+
+  getPass: d => {                                   // what the visitor sees from their link
+    const row = findRow_(d.code);
+    if (!row) throw new Error('Pass not found. Ask your host to send the link again.');
+    const v = decorate_(row.v, today_());
+    return { code: v.code, unit: v.unit, name: v.name, plate: v.plate, purpose: v.purpose, pax: v.pax,
+      visitDate: v.visitDate, validUntil: v.validUntil, state: v.state, stateText: v.stateText,
+      overnight: v.purpose === OVERNIGHT, condo: setting_('Condo name') || 'Residensi Alamanda' };
+  },
+
+  overnightRequest: d => {
+    const u = checkResident_(d.unit, d.pin);
+    return withLock_(() => addOvernight_(u.unit, d.form || {}));
+  },
+
+  myOvernight: d => {
+    const u = checkResident_(d.unit, d.pin);
+    ensureOvernightPasses_();
+    const all = readOvernight_().filter(o => o.unit === u.unit), month = today_().slice(0, 7);
+    const used = all.filter(o => o.status !== 'Not approved')
+      .reduce((n, o) => n + nightsOf_(o.arrive, o.leave).filter(x => x.slice(0, 7) === month).length, 0);
+    return {
+      requests: all.filter(o => o.leave >= addDays_(today_(), -14)).sort((a, b) => b.submitted.localeCompare(a.submitted)).slice(0, 20),
+      used: used, max: Number(setting_('Max overnight nights per month')) || 6, month: month
+    };
+  },
+
+  guardLogin: d => { checkGuard_(d.guardPin); return { ok: true }; },
+
+  guardLookup: d => {
+    checkGuard_(d.guardPin);
+    const row = findRow_(d.code);
+    if (!row) throw new Error('No pass with code ' + cleanCode_(d.code) + '.');
+    return decorate_(row.v, today_());
+  },
+
+  guardCheckIn: d => {
+    checkGuard_(d.guardPin);
+    return withLock_(() => {
+      const row = findRow_(d.code);
+      if (!row) throw new Error('Pass not found.');
+      const v = decorate_(row.v, today_());
+      if (!v.canCheckIn) throw new Error('Cannot check in: ' + v.stateText);
+      const spot = checkBay_(d.level, d.bay, d.code);
+      const ch = { 'Status': 'Checked in', 'Checked in': now_(), 'Checked out': '', 'Guard': clip_(d.guard, 40),
+        'Parking level': spot.level, 'Bay no': spot.bay };
+      if (d.note) ch['Notes'] = clip_((row.v.notes ? row.v.notes + ' | ' : '') + d.note, 300);
+      setCells_(row.n, ch);
+      return decorate_(Object.assign(row.v, { status: 'Checked in', checkedIn: ch['Checked in'], checkedOut: '', level: spot.level, bay: spot.bay }), today_());
+    });
+  },
+
+  guardCheckOut: d => {
+    checkGuard_(d.guardPin);
+    return withLock_(() => {
+      const row = findRow_(d.code);
+      if (!row) throw new Error('Pass not found.');
+      if (row.v.status !== 'Checked in') throw new Error('This visitor is not checked in.');
+      const t = now_();
+      setCells_(row.n, { 'Status': 'Checked out', 'Checked out': t });
+      return decorate_(Object.assign(row.v, { status: 'Checked out', checkedOut: t }), today_());
+    });
+  },
+
+  guardToday: d => {
+    checkGuard_(d.guardPin);
+    ensureOvernightPasses_();
+    const t = today_();
+    const all = readVisitors_().map(v => decorate_(v, t));
+    const inside = all.filter(v => v.status === 'Checked in');
+    const bays = {};
+    LEVELS.forEach(l => bays[l] = { cap: bayCap_(l), used: inside.filter(v => v.level === l && v.bay)
+      .map(v => ({ bay: Number(v.bay), code: v.code, name: v.name, unit: v.unit, plate: v.plate, state: v.state })) });
+    return {
+      bays: bays,
+      inside: inside.sort((a, b) => bayKey_(a).localeCompare(bayKey_(b)) || b.checkedIn.localeCompare(a.checkedIn)),
+      expected: all.filter(v => v.canCheckIn).sort((a, b) => a.unit.localeCompare(b.unit)),
+      overnight: approvedOvernight_().filter(o => o.arrive <= t && o.leave >= t).sort((a, b) => a.unit.localeCompare(b.unit))
+    };
+  },
+
+  guardWalkIn: d => {                               // visitor arrived without a pass
+    checkGuard_(d.guardPin);
+    const unit = normUnit_(d.unit);
+    if (!findUnit_(unit)) throw new Error('Unit ' + unit + ' is not on the list.');
+    return withLock_(() => {
+      const spot = checkBay_(d.level, d.bay, '');
+      return addVisitor_(unit, d.visitor || {}, 'Guard (walk-in)', true, clip_(d.guard, 40), spot);
+    });
+  }
+};
+
+/***** Helpers *****/
+
+function addVisitor_(unit, x, createdBy, checkInNow, guard, spot) {
+  const name = clip_(x.name, 60);
+  if (!name) throw new Error('Please enter the visitor name.');
+  if (x.overnight) throw new Error('Overnight stays need the overnight parking form. This pass is for day visits only.');
+  const days = 1;                                   // day visits only
+  const t = today_();
+  const visitDate = checkInNow ? t : (/^\d{4}-\d{2}-\d{2}$/.test(x.date || '') ? x.date : t);
+  if (visitDate < t) throw new Error('The visit date has already passed.');
+  if (visitDate > addDays_(t, 60)) throw new Error('Visits can be registered up to 60 days ahead.');
+  const perDay = Number(setting_('Max passes per unit per day')) || 10;
+  const created = now_();
+  const madeToday = readVisitors_().filter(v => v.unit === unit && v.created.slice(0, 10) === t).length;
+  if (!checkInNow && madeToday >= perDay) throw new Error('This unit has reached ' + perDay + ' passes today.');
+
+  const code = newCode_();
+  const row = new Array(VISITOR_HEADERS.length).fill('');
+  row[COL['Pass code']] = code;
+  row[COL['Created']] = created;
+  row[COL['Unit']] = unit;
+  row[COL['Visitor name']] = name;
+  row[COL['Phone']] = clip_(x.phone, 20).replace(/[^\d+ -]/g, '');
+  row[COL['Vehicle plate']] = clip_(x.plate, 12).toUpperCase().replace(/\s+/g, '');
+  row[COL['Purpose']] = PURPOSES.indexOf(x.purpose) >= 0 ? x.purpose : 'Guest';
+  row[COL['Pax']] = String(Math.max(1, Math.min(20, Number(x.pax) || 1)));
+  row[COL['Visit date']] = visitDate;
+  row[COL['Valid until']] = addDays_(visitDate, days - 1);
+  row[COL['Status']] = checkInNow ? 'Checked in' : 'Active';
+  row[COL['Checked in']] = checkInNow ? created : '';
+  row[COL['Guard']] = guard || '';
+  row[COL['Notes']] = clip_(x.note, 200);
+  row[COL['Created by']] = createdBy;
+  row[COL['Parking level']] = spot ? spot.level : '';
+  row[COL['Bay no']] = spot ? spot.bay : '';
+  SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Visitors').appendRow(row);
+  return decorate_(rowToVisitor_(row), t);
+}
+
+/***** Visitor parking bays *****/
+
+function bayCap_(level) { return Math.max(0, Number(setting_('Visitor bays Level ' + level)) || (level === 'G' ? 27 : 37)); }
+function bayKey_(v) { return v.level ? (v.level === 'G' ? '0' : '1') + ('00' + v.bay).slice(-3) : '9'; }
+
+/** Checks the bay the guard picked. Level '' means the visitor has no car (walking in, dropped off). */
+function checkBay_(level, bay, code) {
+  level = String(level || '').toUpperCase();
+  if (!level) return { level: '', bay: '' };
+  if (LEVELS.indexOf(level) < 0) throw new Error('Pick parking level G or LG.');
+  const cap = bayCap_(level);
+  const n = Number(bay);
+  const taken = readVisitors_().filter(v => v.status === 'Checked in' && v.level === level && v.bay && v.code !== code);
+  if (taken.length >= cap) throw new Error('Level ' + level + ' is full (' + cap + ' bays). Use the other level, or wait until a visitor checks out.');
+  if (!(n >= 1 && n <= cap && n === Math.floor(n))) throw new Error('Pick a bay number from 1 to ' + cap + ' on Level ' + level + '.');
+  const clash = taken.find(v => Number(v.bay) === n);
+  if (clash) throw new Error('Bay ' + level + '-' + n + ' is taken by ' + clash.name + ' (' + clash.unit + '). Pick another bay.');
+  return { level: level, bay: String(n) };
+}
+
+/** Adds what the page needs to show: a plain status, and whether the guard may let them in. */
+function decorate_(v, t) {
+  let state, text, canIn = false;
+  if (v.status === 'Cancelled') { state = 'bad'; text = 'Cancelled by resident'; }
+  else if (v.status === 'Checked in' && v.purpose === OVERNIGHT && t <= v.validUntil) { state = 'inside'; text = 'Overnight, inside since ' + v.checkedIn + '. ' + (t === v.validUntil ? 'Leaving today.' : 'Leaves ' + v.validUntil + '.'); }
+  else if (v.status === 'Checked in' && v.purpose === OVERNIGHT) { state = 'bad'; text = 'Overstay: overnight pass ended on ' + v.validUntil + ' and the car has not checked out.'; }
+  else if (v.status === 'Checked in' && v.checkedIn.slice(0, 10) < t && overnightFor_(v, t)) { state = 'inside'; text = 'Overnight parking approved until ' + overnightFor_(v, t).leave + ' (' + overnightFor_(v, t).no + ')'; }
+  else if (v.status === 'Checked in' && v.checkedIn.slice(0, 10) < t) { state = 'bad'; text = 'Overstay: checked in on ' + v.checkedIn.slice(0, 10) + ' and has not checked out. Day visits only.'; }
+  else if (v.status === 'Checked in') { state = 'inside'; text = 'Inside since ' + v.checkedIn.slice(11) + (v.checkedIn.slice(0, 10) !== t ? ' on ' + v.checkedIn.slice(0, 10) : ''); }
+  else if (t < v.visitDate) { state = 'wait'; text = 'Not valid yet. Valid from ' + v.visitDate; }
+  else if (t > v.validUntil) { state = 'bad'; text = 'Expired on ' + v.validUntil; }
+  else if (v.status === 'Checked out') { state = 'ok'; text = 'Left at ' + v.checkedOut.slice(11) + '. Pass still valid for re-entry.'; canIn = true; }
+  else if (v.purpose === OVERNIGHT) { state = 'ok'; text = 'Overnight pass, valid ' + v.visitDate + ' to ' + v.validUntil; canIn = true; }
+  else { state = 'ok'; text = 'Valid today only (day visit)'; canIn = true; }
+  return Object.assign({}, v, { state: state, stateText: text, canCheckIn: canIn });
+}
+
+/***** Overnight parking requests *****/
+let OV_CACHE = null;
+
+function addOvernight_(unit, f) {
+  const t = today_();
+  const need = { residentName: 'your name', type: 'owner or tenant', tel: 'your phone number', ic: 'your I.C. number',
+    visitorName: 'the visitor name', plate: 'the car plate', car: 'the car model and colour', arrive: 'the arrival date', leave: 'the leaving date' };
+  Object.keys(need).forEach(k => { if (!clip_(f[k], 80)) throw new Error('Please fill in ' + need[k] + '.'); });
+  if (!f.agree) throw new Error('Please tick the box to agree to the terms and conditions.');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(f.arrive) || !/^\d{4}-\d{2}-\d{2}$/.test(f.leave)) throw new Error('Please pick the dates.');
+  const earliest = earliestOvernight_();
+  if (f.arrive < earliest) throw new Error(f.arrive === t ? 'Same-day overnight requests must be sent before ' + overnightCutoff_() + '. The earliest arrival date now is ' + earliest + '. For urgent cases, contact the management office.' : 'The arrival date has already passed.');
+  if (f.leave <= f.arrive) throw new Error('The leaving date must be after the arrival date.');
+  const nights = Math.round((new Date(f.leave + 'T12:00:00Z') - new Date(f.arrive + 'T12:00:00Z')) / 864e5);
+  const max = Number(setting_('Max overnight nights')) || 2;
+  if (nights > max) throw new Error('Each request is limited to ' + max + ' consecutive nights.');
+  const perMonth = Number(setting_('Max overnight nights per month')) || 6;
+  const used = {};
+  readOvernight_().filter(o => o.unit === unit && o.status !== 'Not approved').forEach(o => nightsOf_(o.arrive, o.leave).forEach(d => used[d.slice(0, 7)] = (used[d.slice(0, 7)] || 0) + 1));
+  nightsOf_(f.arrive, f.leave).forEach(d => {
+    const m = d.slice(0, 7); used[m] = (used[m] || 0) + 1;
+    if (used[m] > perMonth) throw new Error('Each unit can use overnight parking for up to ' + perMonth + ' nights a month free of charge. This unit has no free nights left for ' + m + '. Extra nights need payment, so please book them at the management office (03-2242 4888).');
+  });
+  const no = 'ON-' + Utilities.formatDate(new Date(), TIMEZONE, 'yyMMdd') + '-' + newCode_().slice(0, 4);
+  const row = new Array(OVERNIGHT_HEADERS.length).fill('');
+  row[OCOL['Request no']] = no;
+  row[OCOL['Date of booking']] = now_();
+  row[OCOL['Unit']] = unit;
+  row[OCOL['Resident name']] = clip_(f.residentName, 60);
+  row[OCOL['Owner / Tenant']] = f.type === 'Tenant' ? 'Tenant' : 'Owner';
+  row[OCOL['Tel no']] = clip_(f.tel, 20);
+  row[OCOL['IC no']] = clip_(f.ic, 20);
+  row[OCOL['Visitor name']] = clip_(f.visitorName, 60);
+  row[OCOL['Car plate']] = clip_(f.plate, 12).toUpperCase().replace(/\s+/g, '');
+  row[OCOL['Car model & colour']] = clip_(f.car, 60);
+  row[OCOL['Arrive']] = f.arrive;
+  row[OCOL['Leave']] = f.leave;
+  row[OCOL['Nights']] = String(nights);
+  row[OCOL['Remark']] = clip_(f.remark, 200);
+  row[OCOL['Agreed to terms']] = 'Yes';
+  row[OCOL['Status']] = 'Pending';
+  const osh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Overnight');
+  osh.appendRow(row);
+  osh.getRange(osh.getLastRow(), OCOL[NIGHTS_LEFT] + 1).setFormula(nightsLeftFormula_(osh.getLastRow()));
+  return rowToOvernight_(row);
+}
+
+function colLetter_(i) { let s = ''; i++; while (i > 0) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; }
+
+/** Live count for the sheet: nights still free for this unit in the month of this arrival (pending + approved count). */
+function nightsLeftFormula_(r) {
+  const c = h => colLetter_(OCOL[h]), U = c('Unit'), A = c('Arrive'), N = c('Nights'), S = c('Status');
+  return '=MAX(0, IFERROR(VALUE(VLOOKUP("Max overnight nights per month", Settings!A:B, 2, FALSE)), 6) - SUMPRODUCT(' +
+    '($' + U + '$2:$' + U + '=' + U + r + ') * (LEFT($' + A + '$2:$' + A + ', 7)=LEFT(' + A + r + ', 7)) * ($' + S + '$2:$' + S + '<>"Not approved") * IFERROR(VALUE($' + N + '$2:$' + N + '), 0)))';
+}
+
+/** Puts the Overnight tab in the current column order (moving existing data by header name), then sets formats, drop-downs and formulas. */
+function arrangeOvernight_(sh) {
+  const width = Math.max(sh.getLastColumn(), 1), last = sh.getLastRow();
+  const head = sh.getRange(1, 1, 1, width).getDisplayValues()[0];
+  if (head.join('|') !== OVERNIGHT_HEADERS.join('|')) {
+    const old = last > 1 ? sh.getRange(2, 1, last - 1, width).getDisplayValues() : [];
+    const rows = old.map(r => OVERNIGHT_HEADERS.map(h => head.indexOf(h) >= 0 ? r[head.indexOf(h)] : ''));
+    sh.getRange(1, 1, Math.max(last, 1), Math.max(width, OVERNIGHT_HEADERS.length)).clearContent().clearDataValidations();
+    sh.getRange('A:Z').setNumberFormat('@');                 // dates, IC and phone numbers stay as typed
+    sh.getRange(1, 1, 1, OVERNIGHT_HEADERS.length).setValues([OVERNIGHT_HEADERS]);
+    if (rows.length) sh.getRange(2, 1, rows.length, OVERNIGHT_HEADERS.length).setValues(rows);
+  }
+  sh.getRange(1, 1, 1, OVERNIGHT_HEADERS.length).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  sh.getRange('A:Z').setNumberFormat('@');
+  const col = h => colLetter_(OCOL[h]);
+  sh.getRange(col(NIGHTS_LEFT) + ':' + col(NIGHTS_LEFT)).setNumberFormat('0');
+  sh.getRange(col(NIGHTS_LEFT) + '1').setNumberFormat('@');
+  sh.getRange(col('Status') + '2:' + col('Status')).setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(OVERNIGHT_STATUSES).build());
+  sh.getRange(col('Payment mode') + '2:' + col('Payment mode')).setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(PAYMENT_MODES).build());
+  const n = sh.getLastRow() - 1;
+  if (n > 0) sh.getRange(2, OCOL[NIGHTS_LEFT] + 1, n, 1).setFormulas(Array.from({ length: n }, (_, i) => [nightsLeftFormula_(i + 2)]));
+}
+
+/** The nights of a stay, as the date of each night: arrive 1st, leave 3rd -> ['1st', '2nd']. */
+function nightsOf_(arrive, leave) {
+  const out = []; let d = arrive;
+  while (d < leave && out.length < 60) { out.push(d); d = addDays_(d, 1); }
+  return out;
+}
+
+/** Same-day requests are allowed. If a cutoff time is set in Settings, after it the earliest arrival is tomorrow. */
+function overnightCutoff_() {
+  const c = String(setting_('Same-day overnight cutoff') || '').trim();
+  return /^\d{1,2}:\d{2}$/.test(c) ? c.padStart(5, '0') : '';
+}
+function earliestOvernight_() {
+  const t = today_();
+  const cut = overnightCutoff_();
+  return !cut || now_().slice(11) < cut ? t : addDays_(t, 1);
+}
+
+/** Today plus n working days (Monday to Friday). Public holidays are not counted. */
+function addWorkingDays_(ymd, n) {
+  let d = ymd, left = n;
+  while (left > 0) { d = addDays_(d, 1); const wd = new Date(d + 'T12:00:00Z').getUTCDay(); if (wd !== 0 && wd !== 6) left--; }
+  return d;
+}
+
+function readOvernight_() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Overnight');
+  if (!sh || sh.getLastRow() < 2) return [];
+  return sh.getRange(2, 1, sh.getLastRow() - 1, OVERNIGHT_HEADERS.length).getDisplayValues().map(rowToOvernight_);
+}
+
+function rowToOvernight_(r) {
+  return { no: r[OCOL['Request no']], submitted: r[OCOL['Date of booking']], unit: r[OCOL['Unit']],
+    residentName: r[OCOL['Resident name']], visitorName: r[OCOL['Visitor name']], plate: r[OCOL['Car plate']],
+    car: r[OCOL['Car model & colour']], arrive: r[OCOL['Arrive']], leave: r[OCOL['Leave']], nights: r[OCOL['Nights']],
+    status: r[OCOL['Status']] || 'Pending', notes: r[OCOL['MO notes']], passCode: r[OCOL['Pass code']] || '' };
+}
+
+/** Makes a QR pass for every approved overnight request that does not have one yet.
+ *  The office only sets Status to Approved in the sheet; the pass appears the next time
+ *  the resident or the guard opens the app. */
+function ensureOvernightPasses_() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Overnight');
+  if (!sh || sh.getLastRow() < 2) return;
+  const rows = sh.getRange(2, 1, sh.getLastRow() - 1, OVERNIGHT_HEADERS.length).getDisplayValues();
+  const todo = rows.map((r, i) => ({ r: r, n: i + 2 })).filter(x => x.r[OCOL['Status']] === 'Approved' && !x.r[OCOL['Pass code']]);
+  if (!todo.length) return;
+  withLock_(() => {
+    const vis = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Visitors');
+    todo.forEach(x => {
+      if (sh.getRange(x.n, OCOL['Pass code'] + 1).getDisplayValue()) return;   // made by another request meanwhile
+      const o = rowToOvernight_(x.r);
+      const code = newCode_();
+      const row = new Array(VISITOR_HEADERS.length).fill('');
+      row[COL['Pass code']] = code;
+      row[COL['Created']] = now_();
+      row[COL['Unit']] = o.unit;
+      row[COL['Visitor name']] = o.visitorName;
+      row[COL['Vehicle plate']] = o.plate;
+      row[COL['Purpose']] = OVERNIGHT;
+      row[COL['Pax']] = '1';
+      row[COL['Visit date']] = o.arrive;
+      row[COL['Valid until']] = o.leave;
+      row[COL['Status']] = 'Active';
+      row[COL['Notes']] = clip_('Overnight ' + o.no + (o.car ? ', ' + o.car : '') + (o.notes ? '. Office: ' + o.notes : ''), 300);
+      row[COL['Created by']] = 'Overnight ' + o.no;
+      vis.appendRow(row);
+      sh.getRange(x.n, OCOL['Pass code'] + 1).setValue(code);
+    });
+  });
+  OV_CACHE = null;
+}
+
+function approvedOvernight_() {
+  if (!OV_CACHE) OV_CACHE = readOvernight_().filter(o => o.status === 'Approved');
+  return OV_CACHE;
+}
+
+/** The approved overnight request that covers this checked-in visitor today, matched by unit and car plate or name. */
+function overnightFor_(v, t) {
+  const name = v.name.toLowerCase();
+  return approvedOvernight_().find(o => o.unit === v.unit && o.arrive <= t && o.leave >= t &&
+    ((v.plate && o.plate === v.plate) || o.visitorName.toLowerCase() === name)) || null;
+}
+
+function readVisitors_() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Visitors');
+  const last = sh.getLastRow();
+  if (last < 2) return [];
+  return sh.getRange(2, 1, last - 1, VISITOR_HEADERS.length).getDisplayValues().map(rowToVisitor_);
+}
+
+function rowToVisitor_(r) {
+  return { code: r[COL['Pass code']], created: r[COL['Created']], unit: r[COL['Unit']], name: r[COL['Visitor name']],
+    phone: r[COL['Phone']], plate: r[COL['Vehicle plate']], purpose: r[COL['Purpose']], pax: r[COL['Pax']],
+    visitDate: r[COL['Visit date']], validUntil: r[COL['Valid until']], status: r[COL['Status']],
+    checkedIn: r[COL['Checked in']], checkedOut: r[COL['Checked out']], guard: r[COL['Guard']],
+    notes: r[COL['Notes']], createdBy: r[COL['Created by']], level: r[COL['Parking level']] || '', bay: r[COL['Bay no']] || '' };
+}
+
+function findRow_(code) {
+  code = cleanCode_(code);
+  if (code.length !== 6) return null;
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Visitors');
+  const cell = sh.getRange('A:A').createTextFinder(code).matchEntireCell(true).findNext();
+  if (!cell || cell.getRow() < 2) return null;
+  const vals = sh.getRange(cell.getRow(), 1, 1, VISITOR_HEADERS.length).getDisplayValues()[0];
+  return { n: cell.getRow(), v: rowToVisitor_(vals) };
+}
+
+function setCells_(rowNum, changes) {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Visitors');
+  Object.keys(changes).forEach(h => sh.getRange(rowNum, COL[h] + 1).setValue(changes[h]));
+}
+
+function findUnit_(unit) {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Units');
+  const last = sh.getLastRow();
+  if (last < 2) return null;
+  const rows = sh.getRange(2, 1, last - 1, UNIT_HEADERS.length).getDisplayValues();
+  const r = rows.find(x => normUnit_(x[0]) === unit && String(x[4]).trim().toUpperCase() !== 'N');
+  return r ? { unit: unit, pin: String(r[1]).trim(), name: r[2] } : null;
+}
+
+function checkResident_(unitIn, pin) {
+  const unit = normUnit_(unitIn);
+  if (!/^[A-Z]{1,2}(-\d{2}A?)?-\d{2}A?$/.test(unit)) throw new Error('Unit should look like A-13-10, A-13A-10 or G-02.');
+  throttle_('u:' + unit);
+  const u = findUnit_(unit);
+  if (!u || !u.pin || u.pin !== String(pin || '').trim()) { failed_('u:' + unit); throw new Error('Unit or PIN is wrong.'); }
+  CacheService.getScriptCache().remove('fail:u:' + unit);
+  return u;
+}
+
+function checkGuard_(pin) {
+  throttle_('guard');
+  if (!pin || String(pin).trim() !== String(setting_('Guard PIN')).trim()) { failed_('guard'); throw new Error('Guard PIN is wrong.'); }
+}
+
+function throttle_(key) {
+  const n = Number(CacheService.getScriptCache().get('fail:' + key) || 0);
+  if (n >= MAX_WRONG_PINS) throw new Error('Too many wrong PINs. Try again in 15 minutes.');
+}
+function failed_(key) {
+  const c = CacheService.getScriptCache();
+  c.put('fail:' + key, String(Number(c.get('fail:' + key) || 0) + 1), 900);
+}
+
+/** Link put in QR codes and WhatsApp messages: the home page address if set, else the Apps Script link. */
+function appAddress_() {
+  const home = String(setting_('App address (home page link)') || '').trim().replace(/[?#].*$/, '');
+  return /^https:\/\/[^\s]+$/.test(home) ? home : ScriptApp.getService().getUrl();
+}
+
+function setting_(name) {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Settings');
+  const row = sh.getDataRange().getDisplayValues().find(r => r[0] === name);
+  return row ? row[1] : '';
+}
+
+/** Runs every night. Deletes visitor and overnight rows older than the retention setting. */
+function cleanupOldRecords() {
+  const keep = Number(setting_('Keep visitor records (days)')) || 90;
+  const cutoff = addDays_(today_(), -keep);
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Visitors');
+  const last = sh.getLastRow();
+  const vals = last < 2 ? [] : sh.getRange(2, COL['Valid until'] + 1, last - 1, 1).getDisplayValues();
+  for (let i = vals.length - 1; i >= 0; i--) {
+    if (vals[i][0] && vals[i][0] < cutoff) sh.deleteRow(i + 2);
+  }
+  const on = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Overnight');
+  if (!on || on.getLastRow() < 2) return;
+  const lv = on.getRange(2, OCOL['Leave'] + 1, on.getLastRow() - 1, 1).getDisplayValues();
+  for (let i = lv.length - 1; i >= 0; i--) {
+    if (lv[i][0] && lv[i][0] < cutoff) on.deleteRow(i + 2);
+  }
+}
+
+function ensureSheet_(ss, name, headers) {
+  const sh = ss.getSheetByName(name) || ss.insertSheet(name);
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(headers);
+    sh.setFrozenRows(1);
+    sh.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+  }
+  return sh;
+}
+
+function withLock_(fn) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) throw new Error('System is busy. Please try again.');
+  try { return fn(); } finally { lock.releaseLock(); }
+}
+
+/** "a-13a-10 " -> "A-13A-10" */
+// A-8-3A, a 08 03a and A-08-03A all become A-08-03A: number parts are padded to 2 digits.
+function normUnit_(s) {
+  return String(s || '').toUpperCase().replace(/[\s–—_\/.]+/g, '-').replace(/^-+|-+$/g, '').replace(/-+/g, '-')
+    .split('-').map(p => /^\d+A?$/.test(p) ? p.replace(/^0*(\d+)/, (m, n) => ('0' + n).slice(-Math.max(2, n.length))) : p).join('-');
+}
+function cleanCode_(s) { return String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(-6); }
+function clip_(s, n) { return String(s || '').trim().slice(0, n); }
+function today_() { return Utilities.formatDate(new Date(), TIMEZONE, 'yyyy-MM-dd'); }
+function now_() { return Utilities.formatDate(new Date(), TIMEZONE, 'yyyy-MM-dd HH:mm'); }
+function addDays_(ymd, n) {
+  const d = new Date(ymd + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+function randomPin_() {   // 6 digits, never starting with 0, from a random UUID
+  const hex = Utilities.getUuid().replace(/-/g, '').slice(0, 12);
+  return String(100000 + parseInt(hex, 16) % 900000);
+}
+
+/** Every unit in Residensi Alamanda (list from the committee, 2026-11-25). 3A replaces 4; floors 14, 24, 34 don't exist. */
+function allUnits_() {
+  const floors = ['06', '07', '08', '09', '10', '11', '12', '13', '13A', '15', '16', '17', '18', '19', '20', '21', '22', '23', '23A',
+    '25', '26', '27', '28', '29', '30', '31', '32', '33', '33A', '35', '36'];
+  const doors = ['01', '02', '03', '03A', '05', '06', '07', '08', '09', '10', '11'];
+  const list = [];
+  floors.forEach(f => doors.forEach(d => list.push('A-' + f + '-' + d)));
+  floors.forEach(f => doors.forEach(d => {
+    if (f === '06' && ['09', '10', '11'].indexOf(d) >= 0) return;   // B-06 has units 01 to 08 only
+    if (f === '18' && d === '11') return;                            // B-18 has no unit 11
+    list.push('B-' + f + '-' + d);
+  }));
+  ['02', '03', '04', '05'].forEach(d => list.push('G-' + d));
+  return list;
+}
+
+/** Adds any unit that is not in the Units tab yet, with a new unique PIN. Never changes existing rows or PINs. */
+function addMissingUnits_(sh) {
+  const rows = sh.getLastRow() > 1 ? sh.getRange(2, 1, sh.getLastRow() - 1, 2).getDisplayValues() : [];
+  const have = {}, pins = {};
+  rows.forEach(r => { have[normUnit_(r[0])] = true; pins[String(r[1]).trim()] = true; });
+  const add = [];
+  allUnits_().forEach(u => {
+    if (have[u]) return;
+    let p; do { p = randomPin_(); } while (pins[p]);
+    pins[p] = true;
+    add.push([u, p, '', '', 'Y', '']);
+  });
+  if (add.length) sh.getRange(sh.getLastRow() + 1, 1, add.length, 6).setNumberFormat('@').setValues(add);
+  return add.length;
+}
+function newCode_() {
+  const abc = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';  // no 0/O or 1/I, easy to read out
+  for (let tries = 0; tries < 20; tries++) {
+    let c = ''; for (let i = 0; i < 6; i++) c += abc[Math.floor(Math.random() * abc.length)];
+    if (!findRow_(c)) return c;
+  }
+  throw new Error('Could not make a pass code. Please try again.');
+}
+
